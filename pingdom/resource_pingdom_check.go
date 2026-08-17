@@ -31,6 +31,10 @@ func resourcePingdomCheck() *schema.Resource {
 			StateContext: schema.ImportStatePassthroughContext,
 		},
 
+		// Surface the type-specific requirements at plan time rather than
+		// part-way through an apply.
+		CustomizeDiff: validateCheckForType,
+
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:     schema.TypeString,
@@ -237,6 +241,71 @@ func sortString(input string, seperator string) string {
 	list := strings.Split(input, seperator)
 	sort.Strings(list)
 	return strings.Join(list, seperator)
+}
+
+// validateCheckForType mirrors the per-type validation go-pingdom performs in
+// Check.Valid(). That runs inside Create and Update, so on its own it only
+// reports a problem part-way through an apply -- naming a Go struct field
+// (`ExpectedIP`) rather than the attribute the user wrote, and, on update,
+// after the SDK has already recorded the intended values in state. Running the
+// same checks as a CustomizeDiff moves them to plan time, where the error names
+// the resource and the attribute and nothing has been written yet.
+//
+// The conditions are kept identical to Valid() so this can only reject what the
+// API layer would reject anyway.
+func validateCheckForType(_ context.Context, d *schema.ResourceDiff, _ any) error {
+	return validateCheckValues(checkValues{
+		checkType:        d.Get("type").(string),
+		expectedIP:       d.Get("expectedip").(string),
+		nameServer:       d.Get("nameserver").(string),
+		port:             d.Get("port").(int),
+		shouldContain:    d.Get("shouldcontain").(string),
+		shouldNotContain: d.Get("shouldnotcontain").(string),
+	})
+}
+
+// checkValues is the subset of a check that Valid() inspects. Both
+// *schema.ResourceDiff (plan time) and *schema.ResourceData (apply time)
+// implement Get, but not through a shared interface, so the values are
+// collected into this struct and validated in one place.
+type checkValues struct {
+	checkType        string
+	expectedIP       string
+	nameServer       string
+	port             int
+	shouldContain    string
+	shouldNotContain string
+}
+
+func checkValuesFromResourceData(d *schema.ResourceData) checkValues {
+	return checkValues{
+		checkType:        d.Get("type").(string),
+		expectedIP:       d.Get("expectedip").(string),
+		nameServer:       d.Get("nameserver").(string),
+		port:             d.Get("port").(int),
+		shouldContain:    d.Get("shouldcontain").(string),
+		shouldNotContain: d.Get("shouldnotcontain").(string),
+	}
+}
+
+func validateCheckValues(v checkValues) error {
+	switch v.checkType {
+	case checkTypeDNS:
+		for attr, value := range map[string]string{"expectedip": v.expectedIP, "nameserver": v.nameServer} {
+			if value == "" {
+				return fmt.Errorf("%q is required for %q checks and must not be empty", attr, checkTypeDNS)
+			}
+		}
+	case checkTypeTCP:
+		if v.port < 1 || v.port > 65535 {
+			return fmt.Errorf("%q is required for %q checks and must be between 1 and 65535, got %d", "port", checkTypeTCP, v.port)
+		}
+	case checkTypeHTTP:
+		if v.shouldContain != "" && v.shouldNotContain != "" {
+			return fmt.Errorf("%q and %q must not be set at the same time", "shouldcontain", "shouldnotcontain")
+		}
+	}
+	return nil
 }
 
 // normalizeProbeFilters canonicalises a comma separated probe filter list, so
@@ -645,6 +714,17 @@ func resourcePingdomCheckUpdate(ctx context.Context, d *schema.ResourceData, met
 	if err != nil {
 		return diag.FromErr(err)
 	}
+
+	// The same per-type checks CustomizeDiff runs at plan time. They should
+	// never fire here -- if they do, the value changed between plan and apply,
+	// so say so explicitly rather than letting go-pingdom report a Go field
+	// name from inside the API layer.
+	if err := validateCheckValues(checkValuesFromResourceData(d)); err != nil {
+		return diag.Errorf("Refusing to update check %d: %s. "+
+			"This was valid when the plan was created, so the value was lost between plan and apply", id, err)
+	}
+
+	log.Printf("[DEBUG] Check update configuration: %#v", check.PutParams()["name"])
 
 	_, err = client.Checks.Update(id, check)
 	if err != nil {

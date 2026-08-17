@@ -630,3 +630,65 @@ func TestCheckProbeFiltersSpacingIdempotent(t *testing.T) {
 		t.Errorf("spaced probefilters produced a diff: %v", diff.Attributes)
 	}
 }
+
+// TestValidateCheckForType covers the per-type requirements that go-pingdom
+// only enforces once an apply is already under way.
+func TestValidateCheckForType(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+	r := resourcePingdomCheck()
+
+	for _, tc := range []struct {
+		name    string
+		cfg     map[string]any
+		wantErr string
+	}{
+		{
+			name:    "dns without expectedip",
+			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "nameserver": "10.0.0.2"},
+			wantErr: `"expectedip" is required`,
+		},
+		{
+			name:    "dns without nameserver",
+			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4"},
+			wantErr: `"nameserver" is required`,
+		},
+		{
+			name: "dns complete",
+			cfg:  map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4", "nameserver": "10.0.0.2"},
+		},
+		{
+			name:    "tcp without port",
+			cfg:     map[string]any{"name": "t", "host": "h", "type": checkTypeTCP},
+			wantErr: `"port" is required`,
+		},
+		{
+			name: "tcp with port",
+			cfg:  map[string]any{"name": "t", "host": "h", "type": checkTypeTCP, "port": 443},
+		},
+		{
+			name:    "http with both contain matches",
+			cfg:     map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "a", "shouldnotcontain": "b"},
+			wantErr: `must not be set at the same time`,
+		},
+		{
+			name: "http with an empty contain match",
+			cfg:  map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "", "shouldnotcontain": "b"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Diff(context.Background(), nil, terraform.NewResourceConfigRaw(tc.cfg), meta)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected plan error: %s", err)
+			case tc.wantErr == "":
+				return
+			case err == nil:
+				t.Fatalf("expected a plan-time error containing %q, got none", tc.wantErr)
+			case !strings.Contains(err.Error(), tc.wantErr):
+				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
