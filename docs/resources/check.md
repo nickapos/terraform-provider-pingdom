@@ -44,7 +44,7 @@ The following arguments are supported:
 * `paused` - (Optional) Whether the check is paused.
 * `port` - (Optional) Target port.
 * `postdata` - (Optional) Data that should be posted to the web page, for example submission data for a sign-up or login form. The data needs to be formatted in the same way as a web browser would send it to the web server.
-* `probefilters` - (Optional) Filters used for probe selections. Overwrites previous filters for check. To remove all filters from a check, use an empty value. Comma separated key:value pairs. Currently only region is supported. Possible values are `EU`, `NA`, `APAC`, and `LATAM`. For example, "region: NA".
+* `probefilters` - (Optional) Filters used for probe selections. Overwrites previous filters for check. To remove all filters from a check, use an empty value. Comma separated key:value pairs. Currently only region is supported. Possible values are `EU`, `NA`, `APAC`, and `LATAM`. For example, `"region:NA"` or `"region:NA,region:EU"`. Whitespace around the separators is ignored and the filters are stored in sorted order, so `"region: NA, region: EU"` is equivalent.
 * `requestheaders` - (Optional) Custom HTTP header. The entry value should contain a one-element string array. The element should contain headerName and headerValue colon-separated. To add more than one header send other parameters named requestheaders{number}.
 * `resolution` - (Optional) How often should the check be tested? (minutes). Valid values are `1`, `5`, `15`, `30`, `60`. Default value is `5`.
 * `responsetime_threshold` - (Optional) Triggers a down alert if the response time exceeds threshold specified in ms (Not available for Starter and Free plans.)

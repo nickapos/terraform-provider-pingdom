@@ -48,6 +48,10 @@ func resourcePingdomTmsCheck() *schema.Resource {
 			"active": {
 				Type:     schema.TypeBool,
 				Optional: true,
+				// TMSCheck.Active is serialised unconditionally, so without a
+				// default an omitted `active` sent false on every create and
+				// update and deactivated the check.
+				Default: true,
 			},
 			"contact_ids": {
 				Type:     schema.TypeSet,
@@ -187,7 +191,7 @@ func expandTmsMetadata(m map[string]any) *pingdom.TMSCheckMetaData {
 		metadata.Height = v.(int)
 	}
 
-	if v, ok := m["weight"]; ok {
+	if v, ok := m["width"]; ok {
 		metadata.Width = v.(int)
 	}
 
@@ -216,9 +220,9 @@ func toTmsCheck(d *schema.ResourceData) (*pingdom.TMSCheck, error) {
 		tmsCheck.Steps = expandTmsCheckSteps(interfaceSlice)
 	}
 
-	if v, ok := d.GetOk("active"); ok {
-		tmsCheck.Active = v.(bool)
-	}
+	// d.Get, not d.GetOk: `active` is serialised without omitempty, so an
+	// explicit false has to reach the API rather than be read as "unset".
+	tmsCheck.Active = d.Get("active").(bool)
 
 	if v, ok := d.GetOk("contact_ids"); ok {
 		interfaceSlice := v.(*schema.Set).List()
@@ -296,23 +300,14 @@ func resourcePingdomTmsCheckRead(ctx context.Context, d *schema.ResourceData, me
 	if err != nil {
 		return diag.Errorf("Error retrieving id for TMS check: %s", err)
 	}
-	cl, err := client.TMSCheck.List()
-	if err != nil {
-		return diag.Errorf("Error retrieving list of TMS checks: %s", err)
-	}
-	exists := false
-	for _, ckid := range cl {
-		if ckid.ID == id {
-			exists = true
-			break
-		}
-	}
-	if !exists {
-		d.SetId("")
-		return nil
-	}
+	// Reading the check is enough to tell whether it still exists; listing every
+	// check first only added an extra API call per resource per refresh.
 	ck, err := client.TMSCheck.Read(id)
 	if err != nil {
+		if isCheckGone(err) {
+			d.SetId("")
+			return nil
+		}
 		return diag.Errorf("Error retrieving TMS check: %s", err)
 	}
 

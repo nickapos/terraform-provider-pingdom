@@ -147,6 +147,12 @@ func resourcePingdomCheck() *schema.Resource {
 			"probefilters": {
 				Type:     schema.TypeString,
 				Optional: true,
+				// A check may carry several filters, comma separated. Normalise
+				// spacing and order so they cannot differ from what the API
+				// reports back.
+				StateFunc: func(val any) string {
+					return normalizeProbeFilters(val.(string))
+				},
 			},
 			"userids": {
 				Type:     schema.TypeSet,
@@ -233,152 +239,92 @@ func sortString(input string, seperator string) string {
 	return strings.Join(list, seperator)
 }
 
+// normalizeProbeFilters canonicalises a comma separated probe filter list, so
+// that "region: NA,region:EU" and "region:EU, region: NA" both reduce to
+// "region:EU,region:NA". The API echoes filters back with a space after the
+// colon and in an order of its own choosing, so config and API have to be
+// reduced to the same form or the check shows a permanent diff.
+func normalizeProbeFilters(input string) string {
+	filters := strings.Split(input, ",")
+	out := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		filter = strings.TrimSpace(filter)
+		if filter == "" {
+			continue
+		}
+		if key, value, ok := strings.Cut(filter, ":"); ok {
+			filter = strings.TrimSpace(key) + ":" + strings.TrimSpace(value)
+		}
+		out = append(out, filter)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// expandIntSet converts a schema.TypeSet of ints into a slice. It returns nil
+// for an empty set, which go-pingdom renders as an empty parameter.
+func expandIntSet(v any) []int {
+	set, ok := v.(*schema.Set)
+	if !ok {
+		return nil
+	}
+	return expandReferenceIds(set.List())
+}
+
+// checkForResource builds the API representation of the check described by d.
+//
+// Every field is read with d.Get rather than d.GetOk. GetOk reports ok==false
+// for any zero value, so it cannot distinguish "the user did not set this" from
+// "the user emptied this", and it silently relies on each zero value happening
+// to be the value we want to send anyway. That holds today only because this
+// struct starts zeroed; d.Get states the intent directly and keeps a field
+// whose "off" value is not the zero value from breaking quietly later. The
+// schema supplies every default, so the post-diff value is always the intended
+// one.
 func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
-	checkParams := commonCheckParams{}
-
-	// required
-	if v, ok := d.GetOk("name"); ok {
-		checkParams.Name = v.(string)
+	checkParams := commonCheckParams{
+		Name:                     d.Get("name").(string),
+		Hostname:                 d.Get("host").(string),
+		Paused:                   d.Get("paused").(bool),
+		IPv6:                     d.Get("ipv6").(bool),
+		Resolution:               d.Get("resolution").(int),
+		ResponseTimeThreshold:    d.Get("responsetime_threshold").(int),
+		SendNotificationWhenDown: d.Get("sendnotificationwhendown").(int),
+		NotifyAgainEvery:         d.Get("notifyagainevery").(int),
+		NotifyWhenBackup:         d.Get("notifywhenbackup").(bool),
+		IntegrationIds:           expandIntSet(d.Get("integrationids")),
+		UserIds:                  expandIntSet(d.Get("userids")),
+		TeamIds:                  expandIntSet(d.Get("teamids")),
+		URL:                      d.Get("url").(string),
+		Encryption:               d.Get("encryption").(bool),
+		Port:                     d.Get("port").(int),
+		Username:                 d.Get("username").(string),
+		Password:                 d.Get("password").(string),
+		ShouldContain:            d.Get("shouldcontain").(string),
+		ShouldNotContain:         d.Get("shouldnotcontain").(string),
+		PostData:                 d.Get("postdata").(string),
+		RequestHeaders:           map[string]string{},
+		// Sort alphabetically so the order written in the config cannot differ
+		// from the order the API reports back.
+		Tags:              sortString(d.Get("tags").(string), ","),
+		ProbeFilters:      normalizeProbeFilters(d.Get("probefilters").(string)),
+		StringToSend:      d.Get("stringtosend").(string),
+		StringToExpect:    d.Get("stringtoexpect").(string),
+		ExpectedIP:        d.Get("expectedip").(string),
+		NameServer:        d.Get("nameserver").(string),
+		VerifyCertificate: d.Get("verify_certificate").(bool),
+		SSLDownDaysBefore: d.Get("ssl_down_days_before").(int),
+		CustomMessage:     d.Get("custom_message").(string),
 	}
 
-	if v, ok := d.GetOk("host"); ok {
-		checkParams.Hostname = v.(string)
-	}
-
-	if v, ok := d.GetOk("paused"); ok {
-		checkParams.Paused = v.(bool)
-	}
-
-	if v, ok := d.GetOk("ipv6"); ok {
-		checkParams.IPv6 = v.(bool)
-	}
-
-	if v, ok := d.GetOk("resolution"); ok {
-		checkParams.Resolution = v.(int)
-	}
-
-	if v, ok := d.GetOk("responsetime_threshold"); ok {
-		checkParams.ResponseTimeThreshold = v.(int)
-	}
-
-	if v, ok := d.GetOk("sendnotificationwhendown"); ok {
-		checkParams.SendNotificationWhenDown = v.(int)
-	}
-
-	if v, ok := d.GetOk("notifyagainevery"); ok {
-		checkParams.NotifyAgainEvery = v.(int)
-	}
-
-	if v, ok := d.GetOk("notifywhenbackup"); ok {
-		checkParams.NotifyWhenBackup = v.(bool)
-	}
-
-	if v, ok := d.GetOk("integrationids"); ok {
-		interfaceSlice := v.(*schema.Set).List()
-		var intSlice []int
-		for i := range interfaceSlice {
-			intSlice = append(intSlice, interfaceSlice[i].(int))
-		}
-		checkParams.IntegrationIds = intSlice
-	}
-
-	if v, ok := d.GetOk("userids"); ok {
-		interfaceSlice := v.(*schema.Set).List()
-		var intSlice []int
-		for i := range interfaceSlice {
-			intSlice = append(intSlice, interfaceSlice[i].(int))
-		}
-		checkParams.UserIds = intSlice
-	}
-
-	if v, ok := d.GetOk("teamids"); ok {
-		interfaceSlice := v.(*schema.Set).List()
-		var intSlice []int
-		for i := range interfaceSlice {
-			intSlice = append(intSlice, interfaceSlice[i].(int))
-		}
-		checkParams.TeamIds = intSlice
-	}
-
-	if v, ok := d.GetOk("url"); ok {
-		checkParams.URL = v.(string)
-	}
-
-	if v, ok := d.GetOk("encryption"); ok {
-		checkParams.Encryption = v.(bool)
-	}
-
-	if v, ok := d.GetOk("port"); ok {
-		checkParams.Port = v.(int)
-	}
-
-	if v, ok := d.GetOk("username"); ok {
-		checkParams.Username = v.(string)
-	}
-
-	if v, ok := d.GetOk("password"); ok {
-		checkParams.Password = v.(string)
-	}
-
-	if v, ok := d.GetOk("shouldcontain"); ok {
-		checkParams.ShouldContain = v.(string)
-	}
-
-	if v, ok := d.GetOk("shouldnotcontain"); ok {
-		checkParams.ShouldNotContain = v.(string)
-	}
-
-	if v, ok := d.GetOk("postdata"); ok {
-		checkParams.PostData = v.(string)
-	}
-
-	if m, ok := d.GetOk("requestheaders"); ok {
-		checkParams.RequestHeaders = make(map[string]string)
-		for k, v := range m.(map[string]any) {
-			checkParams.RequestHeaders[k] = v.(string)
-		}
-	}
-	if v, ok := d.GetOk("tags"); ok {
-		// Sort alphabetically before continuing
-		checkParams.Tags = sortString(v.(string), ",")
-	}
-
-	if v, ok := d.GetOk("probefilters"); ok {
-		checkParams.ProbeFilters = v.(string)
-	}
-
-	if v, ok := d.GetOk("stringtosend"); ok {
-		checkParams.StringToSend = v.(string)
-	}
-
-	if v, ok := d.GetOk("stringtoexpect"); ok {
-		checkParams.StringToExpect = v.(string)
-	}
-
-	if v, ok := d.GetOk("expectedip"); ok {
-		checkParams.ExpectedIP = v.(string)
-	}
-
-	if v, ok := d.GetOk("nameserver"); ok {
-		checkParams.NameServer = v.(string)
-	}
-
-	if v, ok := d.GetOk("verify_certificate"); ok {
-		checkParams.VerifyCertificate = v.(bool)
-	}
-
-	if v, ok := d.GetOk("ssl_down_days_before"); ok {
-		checkParams.SSLDownDaysBefore = v.(int)
-	}
-
-	if v, ok := d.GetOk("custom_message"); ok {
-		checkParams.CustomMessage = v.(string)
+	for k, v := range d.Get("requestheaders").(map[string]any) {
+		checkParams.RequestHeaders[k] = v.(string)
 	}
 
 	checkType := d.Get("type")
 	switch checkType {
 	case checkTypeHTTP:
-		return &pingdom.HttpCheck{
+		return httpCheck{&pingdom.HttpCheck{
 			Name:                     checkParams.Name,
 			Hostname:                 checkParams.Hostname,
 			Resolution:               checkParams.Resolution,
@@ -405,7 +351,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			VerifyCertificate:        &checkParams.VerifyCertificate,
 			SSLDownDaysBefore:        &checkParams.SSLDownDaysBefore,
 			CustomMessage:            checkParams.CustomMessage,
-		}, nil
+		}}, nil
 	case checkTypePing:
 		return &pingdom.PingCheck{
 			Name:                     checkParams.Name,
@@ -423,7 +369,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			TeamIds:                  checkParams.TeamIds,
 		}, nil
 	case checkTypeTCP:
-		return &pingdom.TCPCheck{
+		return tcpCheck{&pingdom.TCPCheck{
 			Name:                     checkParams.Name,
 			Hostname:                 checkParams.Hostname,
 			Resolution:               checkParams.Resolution,
@@ -442,7 +388,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			StringToSend:             checkParams.StringToSend,
 			StringToExpect:           checkParams.StringToExpect,
 			CustomMessage:            checkParams.CustomMessage,
-		}, nil
+		}}, nil
 	case checkTypeDNS:
 		return &pingdom.DNSCheck{
 			Name:                     checkParams.Name,
@@ -493,23 +439,14 @@ func resourcePingdomCheckRead(ctx context.Context, d *schema.ResourceData, meta 
 	if err != nil {
 		return diag.Errorf("Error retrieving id for resource: %s", err)
 	}
-	cl, err := client.Checks.List()
+	// Reading the check is enough to tell whether it still exists; listing every
+	// check first only added an extra API call per resource per refresh.
+	ck, err := readCheck(client, id)
 	if err != nil {
-		return diag.Errorf("Error retrieving list of checks: %s", err)
-	}
-	exists := false
-	for _, ckid := range cl {
-		if ckid.ID == id {
-			exists = true
-			break
+		if isCheckGone(err) {
+			d.SetId("")
+			return nil
 		}
-	}
-	if !exists {
-		d.SetId("")
-		return nil
-	}
-	ck, err := client.Checks.Read(id)
-	if err != nil {
 		return diag.Errorf("Error retrieving check: %s", err)
 	}
 
@@ -553,11 +490,18 @@ func resourcePingdomCheckRead(ctx context.Context, d *schema.ResourceData, meta 
 		return diag.FromErr(err)
 	}
 
-	if ck.Status == "paused" {
-		if err := d.Set("paused", true); err != nil {
-			return diag.FromErr(err)
-		}
+	if err := d.Set("custom_message", ck.CustomMessage); err != nil {
+		return diag.FromErr(err)
 	}
+
+	// Paused is the actual pause flag. Status reports health, so it cannot tell
+	// an unpause apart from a check that simply has not been tested yet -- but
+	// it does report "paused", so honour either signal. Setting this
+	// unconditionally is what lets an unpause made outside Terraform be seen.
+	if err := d.Set("paused", ck.Paused || ck.Status == "paused"); err != nil {
+		return diag.FromErr(err)
+	}
+
 	integids := schema.NewSet(
 		func(integrationId any) int { return integrationId.(int) },
 		[]any{},
@@ -591,11 +535,11 @@ func resourcePingdomCheckRead(ctx context.Context, d *schema.ResourceData, meta 
 		return diag.FromErr(err)
 	}
 
-	if probefilters := ck.ProbeFilters; len(probefilters) > 0 {
-		// normalise: "region: NA" -> "region:NA"
-		if err := d.Set("probefilters", strings.Replace(probefilters[0], ": ", ":", 1)); err != nil {
-			return diag.FromErr(err)
-		}
+	// Keep every filter, not just the first: dropping the rest here meant the
+	// next update PUT only the surviving one and deleted the others from the
+	// check. Set unconditionally so removing filters is detected as drift.
+	if err := d.Set("probefilters", normalizeProbeFilters(strings.Join(ck.ProbeFilters, ","))); err != nil {
+		return diag.FromErr(err)
 	}
 
 	if ck.Type.HTTP != nil {

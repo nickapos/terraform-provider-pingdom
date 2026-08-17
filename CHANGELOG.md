@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+BUG FIXES:
+
+* `pingdom_check`: updates no longer leave the check disagreeing with Terraform
+  state. Removing `username`/`password`, `shouldcontain`, `shouldnotcontain`,
+  `stringtosend` or `stringtoexpect` from a configuration now actually clears
+  them on the check, instead of being recorded as empty in state while the check
+  kept its old value. Switching a check from `shouldcontain` to
+  `shouldnotcontain` previously left both set, a combination the Pingdom API
+  rejects.
+* `pingdom_check`: `probefilters` keeps every filter. Only the first was read
+  back, so any subsequent update deleted the rest from the check. Filters are
+  now normalised and sorted, so a value written as `"region: NA"` no longer
+  produces a permanent diff.
+* `pingdom_check`: `custom_message` is refreshed from the API. It could not be
+  read before, so importing a check recorded an empty message and the next
+  apply cleared it.
+* `pingdom_check`: `paused` is read from the API's pause flag rather than
+  inferred from the health status, so pausing or unpausing a check outside
+  Terraform is detected.
+* `pingdom_tms_check`: `width` in the `metadata` block is no longer ignored (it
+  was read from a misspelled key).
+* `pingdom_tms_check`: `active` now defaults to `true`. A configuration that
+  omitted it sent `active: false` on every create and update, deactivating the
+  check.
+
+IMPROVEMENTS:
+
+* `pingdom_check` and `pingdom_tms_check`: refreshing no longer lists every
+  check before reading the one it needs, removing an extra API call per
+  resource per refresh.
+* `pingdom_check`: read attributes with `d.Get` rather than `d.GetOk`, which
+  cannot distinguish an unset value from an explicit zero.
+
 ## 1.1.3 (October 20, 2020)
 
 BREAKING CHANGES:
