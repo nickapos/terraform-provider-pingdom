@@ -254,14 +254,18 @@ func sortString(input string, seperator string) string {
 // The conditions are kept identical to Valid() so this can only reject what the
 // API layer would reject anyway.
 func validateCheckForType(_ context.Context, d *schema.ResourceDiff, _ any) error {
-	return validateCheckValues(checkValues{
-		checkType:        d.Get("type").(string),
-		expectedIP:       d.Get("expectedip").(string),
-		nameServer:       d.Get("nameserver").(string),
-		port:             d.Get("port").(int),
-		shouldContain:    d.Get("shouldcontain").(string),
-		shouldNotContain: d.Get("shouldnotcontain").(string),
-	})
+	// A value interpolated from a resource that does not exist yet is unknown
+	// during plan and reads as the zero value. Treating that as "empty" would
+	// reject a perfectly good configuration, so unknown attributes are skipped
+	// here; Update revalidates once the real value is available.
+	return validateCheckValues(collectCheckValues(d.Get, func(attr string) bool {
+		return !d.NewValueKnown(attr)
+	}))
+}
+
+func checkValuesFromResourceData(d *schema.ResourceData) checkValues {
+	// By apply time every value is known.
+	return collectCheckValues(d.Get, func(string) bool { return false })
 }
 
 // checkValues is the subset of a check that Valid() inspects. Both
@@ -270,38 +274,71 @@ func validateCheckForType(_ context.Context, d *schema.ResourceDiff, _ any) erro
 // collected into this struct and validated in one place.
 type checkValues struct {
 	checkType        string
+	name             string
+	hostname         string
 	expectedIP       string
 	nameServer       string
 	port             int
 	shouldContain    string
 	shouldNotContain string
+	// unknown reports attributes whose value is not yet known, which must not
+	// be reported as missing.
+	unknown map[string]bool
 }
 
-func checkValuesFromResourceData(d *schema.ResourceData) checkValues {
-	return checkValues{
-		checkType:        d.Get("type").(string),
-		expectedIP:       d.Get("expectedip").(string),
-		nameServer:       d.Get("nameserver").(string),
-		port:             d.Get("port").(int),
-		shouldContain:    d.Get("shouldcontain").(string),
-		shouldNotContain: d.Get("shouldnotcontain").(string),
+func collectCheckValues(get func(string) any, isUnknown func(string) bool) checkValues {
+	v := checkValues{
+		checkType:        get("type").(string),
+		name:             get("name").(string),
+		hostname:         get("host").(string),
+		expectedIP:       get("expectedip").(string),
+		nameServer:       get("nameserver").(string),
+		port:             get("port").(int),
+		shouldContain:    get("shouldcontain").(string),
+		shouldNotContain: get("shouldnotcontain").(string),
+		unknown:          map[string]bool{},
 	}
+	for _, attr := range []string{
+		"type", "name", "host", "expectedip", "nameserver",
+		"port", "shouldcontain", "shouldnotcontain",
+	} {
+		if isUnknown(attr) {
+			v.unknown[attr] = true
+		}
+	}
+	return v
 }
 
+// validateCheckValues mirrors the validation go-pingdom performs in
+// Check.Valid(), which otherwise only runs once Create or Update is already
+// under way -- reporting a Go struct field name rather than the attribute the
+// user wrote, and, on update, after the SDK has recorded the intended values in
+// state. The conditions are kept identical to Valid() so this can only reject
+// what the API layer would reject anyway.
 func validateCheckValues(v checkValues) error {
+	// validCommonParameters rejects these for every check type. Note that
+	// Required in the schema only means "present", so an interpolated empty
+	// string reaches the API unless it is caught here.
+	for attr, value := range map[string]string{"name": v.name, "host": v.hostname} {
+		if !v.unknown[attr] && value == "" {
+			return fmt.Errorf("%q must not be empty", attr)
+		}
+	}
+
 	switch v.checkType {
 	case checkTypeDNS:
 		for attr, value := range map[string]string{"expectedip": v.expectedIP, "nameserver": v.nameServer} {
-			if value == "" {
+			if !v.unknown[attr] && value == "" {
 				return fmt.Errorf("%q is required for %q checks and must not be empty", attr, checkTypeDNS)
 			}
 		}
 	case checkTypeTCP:
-		if v.port < 1 || v.port > 65535 {
+		if !v.unknown["port"] && (v.port < 1 || v.port > 65535) {
 			return fmt.Errorf("%q is required for %q checks and must be between 1 and 65535, got %d", "port", checkTypeTCP, v.port)
 		}
 	case checkTypeHTTP:
-		if v.shouldContain != "" && v.shouldNotContain != "" {
+		if !v.unknown["shouldcontain"] && !v.unknown["shouldnotcontain"] &&
+			v.shouldContain != "" && v.shouldNotContain != "" {
 			return fmt.Errorf("%q and %q must not be set at the same time", "shouldcontain", "shouldnotcontain")
 		}
 	}
