@@ -806,12 +806,22 @@ func resourcePingdomCheckUpdate(ctx context.Context, d *schema.ResourceData, met
 
 	log.Printf("[DEBUG] Check update configuration: %#v", check.PutParams()["name"])
 
+	// Captured before the read below replaces these with whatever the API
+	// reports, so the two can be compared.
+	requested := snapshotRequested(d)
+
 	_, err = client.Checks.Update(id, check)
 	if err != nil {
 		return diag.Errorf("Error updating check: %s", err)
 	}
 
-	return resourcePingdomCheckRead(ctx, d, meta)
+	diags := resourcePingdomCheckRead(ctx, d, meta)
+	if diags.HasError() {
+		return diags
+	}
+
+	// The update succeeded, but Pingdom may have silently declined part of it.
+	return append(diags, warnUnappliedSettings(id, unappliedSettings(requested, d))...)
 }
 
 func resourcePingdomCheckDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {

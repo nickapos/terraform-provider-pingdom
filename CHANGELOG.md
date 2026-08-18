@@ -38,6 +38,13 @@ BUG FIXES:
 
 IMPROVEMENTS:
 
+* `pingdom_check`: an update that Pingdom accepts but does not fully apply now
+  raises a warning naming each setting the check does not report back
+  (`teamids`, `userids`, `integrationids`, `probefilters`, `custom_message`).
+  Previously the API answered 200, Terraform reported success, and the only
+  symptom was the same diff reappearing on every subsequent plan.
+* `pingdom_check`: a `teamids` value reported by the API under `teamids` rather
+  than `teams` is no longer discarded while reading the check back.
 * `pingdom_check` and `pingdom_tms_check`: refreshing no longer lists every
   check before reading the one it needs, removing an extra API call per
   resource per refresh.

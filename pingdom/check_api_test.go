@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/mbarper/go-pingdom/pingdom"
@@ -32,6 +33,9 @@ type fakeCheckAPI struct {
 	status string
 	// listed counts list-all-checks calls, which a refresh should not need.
 	listed int
+	// ignoreOnPut names parameters the fake accepts and silently discards,
+	// mimicking Pingdom answering 200 without applying a value.
+	ignoreOnPut []string
 }
 
 const fakeCheckID = 123
@@ -88,6 +92,9 @@ func (f *fakeCheckAPI) start(t *testing.T) (*Clients, func()) {
 			// Pingdom applies the supplied parameters on top of the stored check.
 			for k, v := range got {
 				f.check[k] = v
+			}
+			for _, k := range f.ignoreOnPut {
+				delete(f.check, k)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"message": "ok"})
 		case http.MethodGet:
@@ -825,5 +832,131 @@ func TestCheckUpdateAddsContainMatch(t *testing.T) {
 	}
 	if got := fake.check["shouldcontain"]; got != "=11=" {
 		t.Errorf("stored shouldcontain = %q, want %q", got, "=11=")
+	}
+}
+
+// TestReadCheckTeamIdsShapes guards the team parsing. The documented response
+// reports assigned teams under `teams`, but a `teamids` key must not be
+// discarded: go-pingdom's Checks.Read overwrites it with a slice derived from an
+// empty `teams`, which makes teamids unreadable and shows up as the attribute
+// reappearing in every plan.
+func TestReadCheckTeamIdsShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []int
+	}{
+		{
+			name: "teams array",
+			body: `{"check":{"id":123,"name":"n","teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "teamids array only",
+			body: `{"check":{"id":123,"name":"n","teamids":[324111],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "both present",
+			body: `{"check":{"id":123,"name":"n","teamids":[324111],"teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "neither present",
+			body: `{"check":{"id":123,"name":"n","type":{"http":{}}}}`,
+			want: []int{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			client, err := pingdom.NewClientWithConfig(pingdom.ClientConfig{
+				APIToken: "t", BaseURL: srv.URL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ck, err := readCheck(client, 123)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ck.TeamIds) != len(tc.want) {
+				t.Fatalf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
+			}
+			for i := range tc.want {
+				if ck.TeamIds[i] != tc.want[i] {
+					t.Errorf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestWarnsWhenPingdomIgnoresSetting covers the silent no-op: the API accepts
+// the update, answers 200, and does not store teamids. Terraform reports success
+// and the same diff returns forever, so the provider must say so explicitly.
+func TestWarnsWhenPingdomIgnoresSetting(t *testing.T) {
+	fake := &fakeCheckAPI{ignoreOnPut: []string{"teamids"}}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	state := applyCheck(t, meta, nil, cfg)
+
+	withTeam := baseHTTPConfig()
+	withTeam["teamids"] = []any{324111}
+
+	r := resourcePingdomCheck()
+	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newState, diags := r.Apply(context.Background(), state, diff, meta)
+	if diags.HasError() {
+		t.Fatalf("apply should succeed: %v", diags)
+	}
+	if newState == nil {
+		t.Fatal("expected state after apply")
+	}
+
+	var warned bool
+	for _, d := range diags {
+		if d.Severity == diag.Warning {
+			warned = true
+			fmt.Printf("\nWARNING SHOWN BY TERRAFORM:\n  %s\n%s\n\n", d.Summary, d.Detail)
+			if !strings.Contains(d.Detail, "teamids") {
+				t.Errorf("warning should name teamids: %s", d.Detail)
+			}
+		}
+	}
+	if !warned {
+		t.Error("expected a warning that teamids was not applied")
+	}
+}
+
+// A successful update that is fully applied must stay quiet.
+func TestNoWarningWhenSettingsApplied(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	state := applyCheck(t, meta, nil, cfg)
+
+	withTeam := baseHTTPConfig()
+	withTeam["teamids"] = []any{324111}
+	withTeam["userids"] = []any{111}
+
+	r := resourcePingdomCheck()
+	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, diags := r.Apply(context.Background(), state, diff, meta)
+	for _, d := range diags {
+		t.Errorf("unexpected diagnostic (%v): %s %s", d.Severity, d.Summary, d.Detail)
 	}
 }
