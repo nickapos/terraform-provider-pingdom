@@ -330,6 +330,49 @@ func normalizeProbeFilters(input string) string {
 	return strings.Join(out, ",")
 }
 
+// clearedParams returns the PUT parameters that must be sent empty so Pingdom
+// removes a value the check currently carries.
+//
+// Empty parameters are deliberately kept to a minimum: Pingdom answers 400
+// "Invalid parameter" when it receives an unexpected empty one, so a parameter
+// is only emptied when the prior state actually held a value for it. During
+// create the prior state is empty, so nothing is returned.
+func clearedParams(d *schema.ResourceData, checkType string) []string {
+	wasSet := func(attr string) bool {
+		old, _ := d.GetChange(attr)
+		s, _ := old.(string)
+		return s != ""
+	}
+	isSet := func(attr string) bool { return d.Get(attr).(string) != "" }
+
+	var clear []string
+	switch checkType {
+	case checkTypeHTTP:
+		// Only one of the pair may appear in a request at all, and setting
+		// either one replaces the other, so an explicit clear is needed only
+		// when the config now sets neither.
+		if !isSet("shouldcontain") && !isSet("shouldnotcontain") {
+			switch {
+			case wasSet("shouldcontain"):
+				clear = append(clear, "shouldcontain")
+			case wasSet("shouldnotcontain"):
+				clear = append(clear, "shouldnotcontain")
+			}
+		}
+		// go-pingdom renders the credentials as a single "auth" parameter.
+		if !isSet("username") && wasSet("username") {
+			clear = append(clear, "auth")
+		}
+	case checkTypeTCP:
+		for _, attr := range []string{"stringtosend", "stringtoexpect"} {
+			if !isSet(attr) && wasSet(attr) {
+				clear = append(clear, attr)
+			}
+		}
+	}
+	return clear
+}
+
 // expandIntSet converts a schema.TypeSet of ints into a slice. It returns nil
 // for an empty set, which go-pingdom renders as an empty parameter.
 func expandIntSet(v any) []int {
@@ -393,7 +436,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 	checkType := d.Get("type")
 	switch checkType {
 	case checkTypeHTTP:
-		return httpCheck{&pingdom.HttpCheck{
+		return httpCheck{HttpCheck: &pingdom.HttpCheck{
 			Name:                     checkParams.Name,
 			Hostname:                 checkParams.Hostname,
 			Resolution:               checkParams.Resolution,
@@ -420,7 +463,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			VerifyCertificate:        &checkParams.VerifyCertificate,
 			SSLDownDaysBefore:        &checkParams.SSLDownDaysBefore,
 			CustomMessage:            checkParams.CustomMessage,
-		}}, nil
+		}, clear: clearedParams(d, checkTypeHTTP)}, nil
 	case checkTypePing:
 		return &pingdom.PingCheck{
 			Name:                     checkParams.Name,
@@ -438,7 +481,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			TeamIds:                  checkParams.TeamIds,
 		}, nil
 	case checkTypeTCP:
-		return tcpCheck{&pingdom.TCPCheck{
+		return tcpCheck{TCPCheck: &pingdom.TCPCheck{
 			Name:                     checkParams.Name,
 			Hostname:                 checkParams.Hostname,
 			Resolution:               checkParams.Resolution,
@@ -457,7 +500,7 @@ func checkForResource(d *schema.ResourceData) (pingdom.Check, error) {
 			StringToSend:             checkParams.StringToSend,
 			StringToExpect:           checkParams.StringToExpect,
 			CustomMessage:            checkParams.CustomMessage,
-		}}, nil
+		}, clear: clearedParams(d, checkTypeTCP)}, nil
 	case checkTypeDNS:
 		return &pingdom.DNSCheck{
 			Name:                     checkParams.Name,

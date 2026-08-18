@@ -59,47 +59,66 @@ func isCheckGone(err error) bool {
 }
 
 // go-pingdom builds PUT parameters by omitting keys whose value is empty, which
-// makes some fields impossible to clear: the parameter simply never reaches the
-// API, so the check keeps its old value while Terraform records the new empty
-// one. The wrappers below re-add those keys for updates.
+// makes some fields impossible to clear: the parameter never reaches the API, so
+// the check keeps its old value while Terraform records the new empty one.
+//
+// The obvious fix -- always send the key -- is wrong. Pingdom rejects the whole
+// request with "400 Bad Request: Invalid parameter" when it receives an empty
+// parameter it did not expect, and it refuses shouldcontain and
+// shouldnotcontain together under any circumstances, even with one of them
+// empty. So an empty parameter is sent only when there is genuinely a value to
+// remove, which the caller determines from the prior state and passes in as
+// clear. Anything not being cleared is left exactly as go-pingdom rendered it.
 //
 // Only PutParams is overridden. PostParams still resolves to the embedded
-// implementation, which strips empty values -- correct for create, where an
-// empty parameter would be rejected rather than treated as "clear this".
+// implementation, which strips empty values -- correct for create, where nothing
+// exists to clear.
 
 // httpCheck fixes clearing of HTTP basic auth and the shouldcontain /
 // shouldnotcontain pair.
 type httpCheck struct {
 	*pingdom.HttpCheck
+	// clear names PUT parameters to send empty, e.g. "auth", "shouldcontain".
+	clear []string
 }
 
 func (ck httpCheck) PutParams() map[string]string {
 	m := ck.HttpCheck.PutParams()
 
-	// Sent only when Username is non-empty, so dropping the credentials from
-	// the config would leave the check still authenticating.
-	if _, ok := m["auth"]; !ok {
-		m["auth"] = ""
+	// Send at most one of the pair. go-pingdom already picks one, but it falls
+	// back to shouldnotcontain="" whenever ShouldContain is empty, which is
+	// exactly the rejected combination once shouldcontain is also present.
+	delete(m, "shouldcontain")
+	delete(m, "shouldnotcontain")
+	switch {
+	case ck.ShouldContain != "":
+		m["shouldcontain"] = ck.ShouldContain
+	case ck.ShouldNotContain != "":
+		m["shouldnotcontain"] = ck.ShouldNotContain
 	}
 
-	// go-pingdom sends whichever of the two is set and omits the other, so
-	// switching between them leaves both set on the check -- a combination its
-	// own Valid() rejects. Valid() guarantees at most one is non-empty here, so
-	// sending both is safe and lets either be cleared.
-	m["shouldcontain"] = ck.ShouldContain
-	m["shouldnotcontain"] = ck.ShouldNotContain
-
+	applyClearParams(m, ck.clear)
 	return m
 }
 
 // tcpCheck fixes clearing of the send/expect strings.
 type tcpCheck struct {
 	*pingdom.TCPCheck
+	clear []string
 }
 
 func (ck tcpCheck) PutParams() map[string]string {
 	m := ck.TCPCheck.PutParams()
-	m["stringtosend"] = ck.StringToSend
-	m["stringtoexpect"] = ck.StringToExpect
+	applyClearParams(m, ck.clear)
 	return m
+}
+
+// applyClearParams adds each named parameter as empty, unless a value is
+// already being sent for it.
+func applyClearParams(m map[string]string, clear []string) {
+	for _, key := range clear {
+		if _, ok := m[key]; !ok {
+			m[key] = ""
+		}
+	}
 }

@@ -66,6 +66,25 @@ func (f *fakeCheckAPI) start(t *testing.T) (*Clients, func()) {
 		case http.MethodPut:
 			got := queryMap(r)
 			f.puts = append(f.puts, got)
+			// The real API rejects the whole request when both content
+			// matchers are present, even if one of them is empty.
+			_, hasContain := got["shouldcontain"]
+			_, hasNotContain := got["shouldnotcontain"]
+			if hasContain && hasNotContain {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+					"statuscode": 400, "statusdesc": "Bad Request",
+					"errormessage": "Invalid parameter:  shouldnotcontain",
+				}})
+				return
+			}
+			// Setting either matcher replaces the other.
+			if v, ok := got["shouldcontain"]; ok && v != "" {
+				f.check["shouldnotcontain"] = ""
+			}
+			if v, ok := got["shouldnotcontain"]; ok && v != "" {
+				f.check["shouldcontain"] = ""
+			}
 			// Pingdom applies the supplied parameters on top of the stored check.
 			for k, v := range got {
 				f.check[k] = v
@@ -690,5 +709,37 @@ func TestValidateCheckForType(t *testing.T) {
 				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestCheckUpdateAddsContainMatch reproduces the production failure: an HTTP
+// check with no content matcher and no credentials gains a shouldcontain. The
+// request must not carry shouldnotcontain or auth at all -- Pingdom answers
+// "400 Invalid parameter" for an empty parameter it did not expect, and refuses
+// the two matchers together under any circumstances.
+func TestCheckUpdateAddsContainMatch(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	state := applyCheck(t, meta, nil, baseHTTPConfig())
+
+	cfg := baseHTTPConfig()
+	cfg["shouldcontain"] = "=11="
+	cfg["notifywhenbackup"] = true
+	applyCheck(t, meta, state, cfg)
+
+	put := fake.puts[len(fake.puts)-1]
+	if got, ok := put["shouldnotcontain"]; ok {
+		t.Errorf("PUT must not carry shouldnotcontain alongside shouldcontain, got %q", got)
+	}
+	if got, ok := put["auth"]; ok {
+		t.Errorf("PUT must not carry an empty auth when no credentials were ever set, got %q", got)
+	}
+	if got := put["shouldcontain"]; got != "=11=" {
+		t.Errorf("shouldcontain = %q, want %q", got, "=11=")
+	}
+	if got := fake.check["shouldcontain"]; got != "=11=" {
+		t.Errorf("stored shouldcontain = %q, want %q", got, "=11=")
 	}
 }

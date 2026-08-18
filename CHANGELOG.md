@@ -10,7 +10,13 @@ BUG FIXES:
   them on the check, instead of being recorded as empty in state while the check
   kept its old value. Switching a check from `shouldcontain` to
   `shouldnotcontain` previously left both set, a combination the Pingdom API
-  rejects.
+  rejects. A request never carries both content matchers, and an empty parameter
+  is only ever sent for a field whose prior state held a value, because Pingdom
+  answers `400 Invalid parameter` for an unexpected empty one.
+* `pingdom_check`: type-specific requirements are validated during `plan`
+  instead of failing part-way through `apply` with a message naming a Go struct
+  field: `expectedip`/`nameserver` for `dns` checks, `port` for `tcp` checks,
+  and `shouldcontain`/`shouldnotcontain` not being set together.
 * `pingdom_check`: `probefilters` keeps every filter. Only the first was read
   back, so any subsequent update deleted the rest from the check. Filters are
   now normalised and sorted, so a value written as `"region: NA"` no longer
