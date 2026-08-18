@@ -13,13 +13,10 @@ BUG FIXES:
   rejects. A request never carries both content matchers, and an empty parameter
   is only ever sent for a field whose prior state held a value, because Pingdom
   answers `400 Invalid parameter` for an unexpected empty one.
-* `pingdom_check`: requirements are validated during `plan` instead of failing
-  part-way through `apply` with a message naming a Go struct field: `name` and
-  `host` must be non-empty (`Required` in the schema only means "present", so an
-  interpolated empty string previously reached the API), plus
-  `expectedip`/`nameserver` for `dns` checks, `port` for `tcp` checks, and
-  `shouldcontain`/`shouldnotcontain` not being set together. Attributes whose
-  value is not yet known at plan time are skipped rather than reported as empty.
+* `pingdom_check`: type-specific requirements are validated during `plan`
+  instead of failing part-way through `apply` with a message naming a Go struct
+  field: `expectedip`/`nameserver` for `dns` checks, `port` for `tcp` checks,
+  and `shouldcontain`/`shouldnotcontain` not being set together.
 * `pingdom_check`: `probefilters` keeps every filter. Only the first was read
   back, so any subsequent update deleted the rest from the check. Filters are
   now normalised and sorted, so a value written as `"region: NA"` no longer
@@ -38,13 +35,6 @@ BUG FIXES:
 
 IMPROVEMENTS:
 
-* `pingdom_check`: an update that Pingdom accepts but does not fully apply now
-  raises a warning naming each setting the check does not report back
-  (`teamids`, `userids`, `integrationids`, `probefilters`, `custom_message`).
-  Previously the API answered 200, Terraform reported success, and the only
-  symptom was the same diff reappearing on every subsequent plan.
-* `pingdom_check`: a `teamids` value reported by the API under `teamids` rather
-  than `teams` is no longer discarded while reading the check back.
 * `pingdom_check` and `pingdom_tms_check`: refreshing no longer lists every
   check before reading the one it needs, removing an extra API call per
   resource per refresh.

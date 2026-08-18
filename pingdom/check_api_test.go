@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/mbarper/go-pingdom/pingdom"
@@ -33,9 +32,6 @@ type fakeCheckAPI struct {
 	status string
 	// listed counts list-all-checks calls, which a refresh should not need.
 	listed int
-	// ignoreOnPut names parameters the fake accepts and silently discards,
-	// mimicking Pingdom answering 200 without applying a value.
-	ignoreOnPut []string
 }
 
 const fakeCheckID = 123
@@ -92,9 +88,6 @@ func (f *fakeCheckAPI) start(t *testing.T) (*Clients, func()) {
 			// Pingdom applies the supplied parameters on top of the stored check.
 			for k, v := range got {
 				f.check[k] = v
-			}
-			for _, k := range f.ignoreOnPut {
-				delete(f.check, k)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"message": "ok"})
 		case http.MethodGet:
@@ -657,104 +650,9 @@ func TestCheckProbeFiltersSpacingIdempotent(t *testing.T) {
 	}
 }
 
-// TestValidateCheckValues unit-tests the shared validation. These are the
-// conditions go-pingdom only enforces once an apply is under way.
-func TestValidateCheckValues(t *testing.T) {
-	base := func(t string) checkValues {
-		return checkValues{checkType: t, name: "n", hostname: "h", unknown: map[string]bool{}}
-	}
-	for _, tc := range []struct {
-		name    string
-		values  func() checkValues
-		wantErr string
-	}{
-		{"empty name", func() checkValues { v := base(checkTypeHTTP); v.name = ""; return v }, `"name" must not be empty`},
-		{"empty host", func() checkValues { v := base(checkTypeHTTP); v.hostname = ""; return v }, `"host" must not be empty`},
-		{
-			"empty host but unknown",
-			func() checkValues {
-				v := base(checkTypeHTTP)
-				v.hostname = ""
-				v.unknown["host"] = true
-				return v
-			},
-			"",
-		},
-		{"dns without expectedip", func() checkValues { v := base(checkTypeDNS); v.nameServer = "ns"; return v }, `"expectedip" is required`},
-		{"dns without nameserver", func() checkValues { v := base(checkTypeDNS); v.expectedIP = "1.2.3.4"; return v }, `"nameserver" is required`},
-		{
-			"dns with unknown expectedip",
-			func() checkValues {
-				v := base(checkTypeDNS)
-				v.nameServer = "ns"
-				v.unknown["expectedip"] = true
-				return v
-			},
-			"",
-		},
-		{
-			"dns complete",
-			func() checkValues {
-				v := base(checkTypeDNS)
-				v.expectedIP = "1.2.3.4"
-				v.nameServer = "ns"
-				return v
-			},
-			"",
-		},
-		{"tcp without port", func() checkValues { return base(checkTypeTCP) }, `"port" is required`},
-		{"tcp port out of range", func() checkValues { v := base(checkTypeTCP); v.port = 70000; return v }, `"port" is required`},
-		{
-			"tcp with unknown port",
-			func() checkValues {
-				v := base(checkTypeTCP)
-				v.unknown["port"] = true
-				return v
-			},
-			"",
-		},
-		{"tcp with port", func() checkValues { v := base(checkTypeTCP); v.port = 443; return v }, ""},
-		{
-			"http with both contain matches",
-			func() checkValues {
-				v := base(checkTypeHTTP)
-				v.shouldContain = "a"
-				v.shouldNotContain = "b"
-				return v
-			},
-			`must not be set at the same time`,
-		},
-		{
-			"http with one contain match",
-			func() checkValues {
-				v := base(checkTypeHTTP)
-				v.shouldNotContain = "b"
-				return v
-			},
-			"",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateCheckValues(tc.values())
-			switch {
-			case tc.wantErr == "" && err != nil:
-				t.Fatalf("unexpected error: %s", err)
-			case tc.wantErr == "":
-			case err == nil:
-				t.Fatalf("expected an error containing %q, got none", tc.wantErr)
-			case !strings.Contains(err.Error(), tc.wantErr):
-				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-// TestValidateCheckAtPlan drives the CustomizeDiff through a real plan. An empty
-// host must be rejected before any API call; unknown values must not be.
-func TestValidateCheckAtPlan(t *testing.T) {
-	// The sentinel the SDK uses for a value that is not yet known.
-	const unknown = "74D93920-ED26-11E3-AC10-0800200C9A66"
-
+// TestValidateCheckForType covers the per-type requirements that go-pingdom
+// only enforces once an apply is already under way.
+func TestValidateCheckForType(t *testing.T) {
 	fake := &fakeCheckAPI{}
 	meta, stop := fake.start(t)
 	defer stop()
@@ -766,26 +664,36 @@ func TestValidateCheckAtPlan(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "http with an empty host",
-			cfg:     map[string]any{"name": "n", "host": "", "type": checkTypeHTTP, "ipv6": true},
-			wantErr: `"host" must not be empty`,
-		},
-		{
-			name:    "dns with an empty expectedip",
-			cfg:     map[string]any{"name": "n", "host": "h", "type": checkTypeDNS, "nameserver": "ns"},
+			name:    "dns without expectedip",
+			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "nameserver": "10.0.0.2"},
 			wantErr: `"expectedip" is required`,
 		},
 		{
-			name: "host not yet known",
-			cfg:  map[string]any{"name": "n", "host": unknown, "type": checkTypeHTTP},
+			name:    "dns without nameserver",
+			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4"},
+			wantErr: `"nameserver" is required`,
 		},
 		{
-			name: "dns values not yet known",
-			cfg:  map[string]any{"name": "n", "host": "h", "type": checkTypeDNS, "nameserver": unknown, "expectedip": unknown},
+			name: "dns complete",
+			cfg:  map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4", "nameserver": "10.0.0.2"},
 		},
 		{
-			name: "ipv6 http check is fine",
-			cfg:  map[string]any{"name": "n", "host": "2a02:e980:1f:1::8", "type": checkTypeHTTP, "ipv6": true},
+			name:    "tcp without port",
+			cfg:     map[string]any{"name": "t", "host": "h", "type": checkTypeTCP},
+			wantErr: `"port" is required`,
+		},
+		{
+			name: "tcp with port",
+			cfg:  map[string]any{"name": "t", "host": "h", "type": checkTypeTCP, "port": 443},
+		},
+		{
+			name:    "http with both contain matches",
+			cfg:     map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "a", "shouldnotcontain": "b"},
+			wantErr: `must not be set at the same time`,
+		},
+		{
+			name: "http with an empty contain match",
+			cfg:  map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "", "shouldnotcontain": "b"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -794,8 +702,9 @@ func TestValidateCheckAtPlan(t *testing.T) {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("unexpected plan error: %s", err)
 			case tc.wantErr == "":
+				return
 			case err == nil:
-				t.Fatalf("expected a plan error containing %q, got none", tc.wantErr)
+				t.Fatalf("expected a plan-time error containing %q, got none", tc.wantErr)
 			case !strings.Contains(err.Error(), tc.wantErr):
 				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
 			}
@@ -832,131 +741,5 @@ func TestCheckUpdateAddsContainMatch(t *testing.T) {
 	}
 	if got := fake.check["shouldcontain"]; got != "=11=" {
 		t.Errorf("stored shouldcontain = %q, want %q", got, "=11=")
-	}
-}
-
-// TestReadCheckTeamIdsShapes guards the team parsing. The documented response
-// reports assigned teams under `teams`, but a `teamids` key must not be
-// discarded: go-pingdom's Checks.Read overwrites it with a slice derived from an
-// empty `teams`, which makes teamids unreadable and shows up as the attribute
-// reappearing in every plan.
-func TestReadCheckTeamIdsShapes(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		body string
-		want []int
-	}{
-		{
-			name: "teams array",
-			body: `{"check":{"id":123,"name":"n","teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
-			want: []int{324111},
-		},
-		{
-			name: "teamids array only",
-			body: `{"check":{"id":123,"name":"n","teamids":[324111],"type":{"http":{}}}}`,
-			want: []int{324111},
-		},
-		{
-			name: "both present",
-			body: `{"check":{"id":123,"name":"n","teamids":[324111],"teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
-			want: []int{324111},
-		},
-		{
-			name: "neither present",
-			body: `{"check":{"id":123,"name":"n","type":{"http":{}}}}`,
-			want: []int{},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(tc.body))
-			}))
-			defer srv.Close()
-
-			client, err := pingdom.NewClientWithConfig(pingdom.ClientConfig{
-				APIToken: "t", BaseURL: srv.URL,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			ck, err := readCheck(client, 123)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(ck.TeamIds) != len(tc.want) {
-				t.Fatalf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
-			}
-			for i := range tc.want {
-				if ck.TeamIds[i] != tc.want[i] {
-					t.Errorf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
-				}
-			}
-		})
-	}
-}
-
-// TestWarnsWhenPingdomIgnoresSetting covers the silent no-op: the API accepts
-// the update, answers 200, and does not store teamids. Terraform reports success
-// and the same diff returns forever, so the provider must say so explicitly.
-func TestWarnsWhenPingdomIgnoresSetting(t *testing.T) {
-	fake := &fakeCheckAPI{ignoreOnPut: []string{"teamids"}}
-	meta, stop := fake.start(t)
-	defer stop()
-
-	cfg := baseHTTPConfig()
-	state := applyCheck(t, meta, nil, cfg)
-
-	withTeam := baseHTTPConfig()
-	withTeam["teamids"] = []any{324111}
-
-	r := resourcePingdomCheck()
-	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newState, diags := r.Apply(context.Background(), state, diff, meta)
-	if diags.HasError() {
-		t.Fatalf("apply should succeed: %v", diags)
-	}
-	if newState == nil {
-		t.Fatal("expected state after apply")
-	}
-
-	var warned bool
-	for _, d := range diags {
-		if d.Severity == diag.Warning {
-			warned = true
-			fmt.Printf("\nWARNING SHOWN BY TERRAFORM:\n  %s\n%s\n\n", d.Summary, d.Detail)
-			if !strings.Contains(d.Detail, "teamids") {
-				t.Errorf("warning should name teamids: %s", d.Detail)
-			}
-		}
-	}
-	if !warned {
-		t.Error("expected a warning that teamids was not applied")
-	}
-}
-
-// A successful update that is fully applied must stay quiet.
-func TestNoWarningWhenSettingsApplied(t *testing.T) {
-	fake := &fakeCheckAPI{}
-	meta, stop := fake.start(t)
-	defer stop()
-
-	cfg := baseHTTPConfig()
-	state := applyCheck(t, meta, nil, cfg)
-
-	withTeam := baseHTTPConfig()
-	withTeam["teamids"] = []any{324111}
-	withTeam["userids"] = []any{111}
-
-	r := resourcePingdomCheck()
-	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, diags := r.Apply(context.Background(), state, diff, meta)
-	for _, d := range diags {
-		t.Errorf("unexpected diagnostic (%v): %s %s", d.Severity, d.Summary, d.Detail)
 	}
 }

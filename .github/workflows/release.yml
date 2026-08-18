@@ -9,7 +9,7 @@
 # You will need to pass the `--batch` flag to `gpg` in your signing step
 # in `goreleaser` to indicate this is being used in a non-interactive mode.
 #
-name: release
+name: Release
 on:
   push:
     tags:
@@ -39,7 +39,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v7.2.3
         with:
           version: latest
-          args: release --rm-dist
+          args: release --clean
         env:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
           # GitHub sets this automatically
