@@ -55,7 +55,13 @@ The following arguments are supported:
 * `tags` - (Optional) List of tags for check. The maximum length of a tag is 64 characters.
 * `stringtoexpect` - (Optional) String to expect in response. Valid for `tcp` check.
 * `stringtosend` - (Optional) String to send. Valid for `tcp` check.
-* `teamids` - (Optional) Teams to alert.
+* `teamids` - (Optional) Teams to alert. Note that Pingdom may accept this
+  parameter and silently not apply it: the update returns success while the check
+  continues to report no teams, which Terraform then plans again on every run. If
+  that happens the provider raises a warning naming the attribute. It appears to
+  depend on the account or plan rather than on the request, so verify with
+  Pingdom support before relying on it, and use `userids` to alert individual
+  contacts in the meantime.
 * `url` - (Optional) Path to target on server.
 * `userids` - (Optional) Users to alert.
 * `username` - (Optional) Username to auth with.

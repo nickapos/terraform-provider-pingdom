@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/mbarper/go-pingdom/pingdom"
@@ -32,6 +33,10 @@ type fakeCheckAPI struct {
 	status string
 	// listed counts list-all-checks calls, which a refresh should not need.
 	listed int
+	// ignoredParams names parameters the fake accepts and silently discards on
+	// both create and update, mimicking Pingdom answering success without
+	// applying a value -- as it does for teamids.
+	ignoredParams []string
 }
 
 const fakeCheckID = 123
@@ -44,13 +49,18 @@ func (f *fakeCheckAPI) start(t *testing.T) (*Clients, func()) {
 		switch r.Method {
 		case http.MethodPost:
 			f.check = queryMap(r)
+			for _, k := range f.ignoredParams {
+				delete(f.check, k)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"check": map[string]any{"id": fakeCheckID},
 			})
 		case http.MethodGet:
 			f.listed++
+			// The real list endpoint returns a reduced representation, but it
+			// does include the fields this exercises.
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"checks": []map[string]any{{"id": fakeCheckID}},
+				"checks": []map[string]any{f.response()},
 			})
 		}
 	})
@@ -88,6 +98,9 @@ func (f *fakeCheckAPI) start(t *testing.T) (*Clients, func()) {
 			// Pingdom applies the supplied parameters on top of the stored check.
 			for k, v := range got {
 				f.check[k] = v
+			}
+			for _, k := range f.ignoredParams {
+				delete(f.check, k)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"message": "ok"})
 		case http.MethodGet:
@@ -650,9 +663,104 @@ func TestCheckProbeFiltersSpacingIdempotent(t *testing.T) {
 	}
 }
 
-// TestValidateCheckForType covers the per-type requirements that go-pingdom
-// only enforces once an apply is already under way.
-func TestValidateCheckForType(t *testing.T) {
+// TestValidateCheckValues unit-tests the shared validation. These are the
+// conditions go-pingdom only enforces once an apply is under way.
+func TestValidateCheckValues(t *testing.T) {
+	base := func(t string) checkValues {
+		return checkValues{checkType: t, name: "n", hostname: "h", unknown: map[string]bool{}}
+	}
+	for _, tc := range []struct {
+		name    string
+		values  func() checkValues
+		wantErr string
+	}{
+		{"empty name", func() checkValues { v := base(checkTypeHTTP); v.name = ""; return v }, `"name" must not be empty`},
+		{"empty host", func() checkValues { v := base(checkTypeHTTP); v.hostname = ""; return v }, `"host" must not be empty`},
+		{
+			"empty host but unknown",
+			func() checkValues {
+				v := base(checkTypeHTTP)
+				v.hostname = ""
+				v.unknown["host"] = true
+				return v
+			},
+			"",
+		},
+		{"dns without expectedip", func() checkValues { v := base(checkTypeDNS); v.nameServer = "ns"; return v }, `"expectedip" is required`},
+		{"dns without nameserver", func() checkValues { v := base(checkTypeDNS); v.expectedIP = "1.2.3.4"; return v }, `"nameserver" is required`},
+		{
+			"dns with unknown expectedip",
+			func() checkValues {
+				v := base(checkTypeDNS)
+				v.nameServer = "ns"
+				v.unknown["expectedip"] = true
+				return v
+			},
+			"",
+		},
+		{
+			"dns complete",
+			func() checkValues {
+				v := base(checkTypeDNS)
+				v.expectedIP = "1.2.3.4"
+				v.nameServer = "ns"
+				return v
+			},
+			"",
+		},
+		{"tcp without port", func() checkValues { return base(checkTypeTCP) }, `"port" is required`},
+		{"tcp port out of range", func() checkValues { v := base(checkTypeTCP); v.port = 70000; return v }, `"port" is required`},
+		{
+			"tcp with unknown port",
+			func() checkValues {
+				v := base(checkTypeTCP)
+				v.unknown["port"] = true
+				return v
+			},
+			"",
+		},
+		{"tcp with port", func() checkValues { v := base(checkTypeTCP); v.port = 443; return v }, ""},
+		{
+			"http with both contain matches",
+			func() checkValues {
+				v := base(checkTypeHTTP)
+				v.shouldContain = "a"
+				v.shouldNotContain = "b"
+				return v
+			},
+			`must not be set at the same time`,
+		},
+		{
+			"http with one contain match",
+			func() checkValues {
+				v := base(checkTypeHTTP)
+				v.shouldNotContain = "b"
+				return v
+			},
+			"",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCheckValues(tc.values())
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %s", err)
+			case tc.wantErr == "":
+			case err == nil:
+				t.Fatalf("expected an error containing %q, got none", tc.wantErr)
+			case !strings.Contains(err.Error(), tc.wantErr):
+				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateCheckAtPlan drives the CustomizeDiff through a real plan. An empty
+// host must be rejected before any API call; unknown values must not be.
+func TestValidateCheckAtPlan(t *testing.T) {
+	// The sentinel the SDK uses for a value that is not yet known.
+	const unknown = "74D93920-ED26-11E3-AC10-0800200C9A66"
+
 	fake := &fakeCheckAPI{}
 	meta, stop := fake.start(t)
 	defer stop()
@@ -664,36 +772,26 @@ func TestValidateCheckForType(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "dns without expectedip",
-			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "nameserver": "10.0.0.2"},
+			name:    "http with an empty host",
+			cfg:     map[string]any{"name": "n", "host": "", "type": checkTypeHTTP, "ipv6": true},
+			wantErr: `"host" must not be empty`,
+		},
+		{
+			name:    "dns with an empty expectedip",
+			cfg:     map[string]any{"name": "n", "host": "h", "type": checkTypeDNS, "nameserver": "ns"},
 			wantErr: `"expectedip" is required`,
 		},
 		{
-			name:    "dns without nameserver",
-			cfg:     map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4"},
-			wantErr: `"nameserver" is required`,
+			name: "host not yet known",
+			cfg:  map[string]any{"name": "n", "host": unknown, "type": checkTypeHTTP},
 		},
 		{
-			name: "dns complete",
-			cfg:  map[string]any{"name": "d", "host": "h", "type": checkTypeDNS, "expectedip": "1.2.3.4", "nameserver": "10.0.0.2"},
+			name: "dns values not yet known",
+			cfg:  map[string]any{"name": "n", "host": "h", "type": checkTypeDNS, "nameserver": unknown, "expectedip": unknown},
 		},
 		{
-			name:    "tcp without port",
-			cfg:     map[string]any{"name": "t", "host": "h", "type": checkTypeTCP},
-			wantErr: `"port" is required`,
-		},
-		{
-			name: "tcp with port",
-			cfg:  map[string]any{"name": "t", "host": "h", "type": checkTypeTCP, "port": 443},
-		},
-		{
-			name:    "http with both contain matches",
-			cfg:     map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "a", "shouldnotcontain": "b"},
-			wantErr: `must not be set at the same time`,
-		},
-		{
-			name: "http with an empty contain match",
-			cfg:  map[string]any{"name": "h", "host": "h", "type": checkTypeHTTP, "shouldcontain": "", "shouldnotcontain": "b"},
+			name: "ipv6 http check is fine",
+			cfg:  map[string]any{"name": "n", "host": "2a02:e980:1f:1::8", "type": checkTypeHTTP, "ipv6": true},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -702,9 +800,8 @@ func TestValidateCheckForType(t *testing.T) {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("unexpected plan error: %s", err)
 			case tc.wantErr == "":
-				return
 			case err == nil:
-				t.Fatalf("expected a plan-time error containing %q, got none", tc.wantErr)
+				t.Fatalf("expected a plan error containing %q, got none", tc.wantErr)
 			case !strings.Contains(err.Error(), tc.wantErr):
 				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
 			}
@@ -741,5 +838,294 @@ func TestCheckUpdateAddsContainMatch(t *testing.T) {
 	}
 	if got := fake.check["shouldcontain"]; got != "=11=" {
 		t.Errorf("stored shouldcontain = %q, want %q", got, "=11=")
+	}
+}
+
+// TestReadCheckTeamIdsShapes guards the team parsing. The documented response
+// reports assigned teams under `teams`, but a `teamids` key must not be
+// discarded: go-pingdom's Checks.Read overwrites it with a slice derived from an
+// empty `teams`, which makes teamids unreadable and shows up as the attribute
+// reappearing in every plan.
+func TestReadCheckTeamIdsShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []int
+	}{
+		{
+			name: "teams array",
+			body: `{"check":{"id":123,"name":"n","teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "teamids array only",
+			body: `{"check":{"id":123,"name":"n","teamids":[324111],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "both present",
+			body: `{"check":{"id":123,"name":"n","teamids":[324111],"teams":[{"id":324111,"name":"oncall"}],"type":{"http":{}}}}`,
+			want: []int{324111},
+		},
+		{
+			name: "neither present",
+			body: `{"check":{"id":123,"name":"n","type":{"http":{}}}}`,
+			want: []int{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			client, err := pingdom.NewClientWithConfig(pingdom.ClientConfig{
+				APIToken: "t", BaseURL: srv.URL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ck, err := readCheck(client, 123)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ck.TeamIds) != len(tc.want) {
+				t.Fatalf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
+			}
+			for i := range tc.want {
+				if ck.TeamIds[i] != tc.want[i] {
+					t.Errorf("TeamIds = %v, want %v", ck.TeamIds, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestWarnsWhenPingdomIgnoresSetting covers the silent no-op: the API accepts
+// the update, answers 200, and does not store teamids. Terraform reports success
+// and the same diff returns forever, so the provider must say so explicitly.
+func TestWarnsWhenPingdomIgnoresSetting(t *testing.T) {
+	fake := &fakeCheckAPI{ignoredParams: []string{"teamids"}}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	state := applyCheck(t, meta, nil, cfg)
+
+	withTeam := baseHTTPConfig()
+	withTeam["teamids"] = []any{324111}
+
+	r := resourcePingdomCheck()
+	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newState, diags := r.Apply(context.Background(), state, diff, meta)
+	if diags.HasError() {
+		t.Fatalf("apply should succeed: %v", diags)
+	}
+	if newState == nil {
+		t.Fatal("expected state after apply")
+	}
+
+	var warned bool
+	for _, d := range diags {
+		if d.Severity == diag.Warning {
+			warned = true
+			fmt.Printf("\nWARNING SHOWN BY TERRAFORM:\n  %s\n%s\n\n", d.Summary, d.Detail)
+			if !strings.Contains(d.Detail, "teamids") {
+				t.Errorf("warning should name teamids: %s", d.Detail)
+			}
+		}
+	}
+	if !warned {
+		t.Error("expected a warning that teamids was not applied")
+	}
+}
+
+// A successful update that is fully applied must stay quiet.
+func TestNoWarningWhenSettingsApplied(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	state := applyCheck(t, meta, nil, cfg)
+
+	withTeam := baseHTTPConfig()
+	withTeam["teamids"] = []any{324111}
+	withTeam["userids"] = []any{111}
+
+	r := resourcePingdomCheck()
+	diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(withTeam), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, diags := r.Apply(context.Background(), state, diff, meta)
+	for _, d := range diags {
+		t.Errorf("unexpected diagnostic (%v): %s %s", d.Severity, d.Summary, d.Detail)
+	}
+}
+
+// TestUpdateOmitsUnsetListParams covers the suspected cause of teamids never
+// sticking: go-pingdom renders userids/teamids/integrationids on every request
+// even when empty, and an unexpected empty parameter is something this API
+// mishandles. A parameter that was never set must not be sent at all.
+func TestUpdateOmitsUnsetListParams(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	state := applyCheck(t, meta, nil, baseHTTPConfig())
+
+	// Assign a team. userids and integrationids stay unset.
+	withTeam := baseHTTPConfig()
+	withTeam["teamids"] = []any{324111}
+	applyCheck(t, meta, state, withTeam)
+
+	put := fake.puts[len(fake.puts)-1]
+	if got := put["teamids"]; got != "324111" {
+		t.Errorf("teamids = %q, want 324111", got)
+	}
+	for _, key := range []string{"userids", "integrationids"} {
+		if got, present := put[key]; present {
+			t.Errorf("%s must be omitted when never set, got %q", key, got)
+		}
+	}
+}
+
+// Emptying a list that previously had a value must still clear it, which needs
+// the empty parameter to be sent explicitly.
+func TestUpdateClearsPreviouslySetListParams(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	cfg["teamids"] = []any{324111}
+	cfg["userids"] = []any{111}
+	state := applyCheck(t, meta, nil, cfg)
+
+	applyCheck(t, meta, state, baseHTTPConfig())
+
+	put := fake.puts[len(fake.puts)-1]
+	for _, key := range []string{"teamids", "userids"} {
+		got, present := put[key]
+		if !present {
+			t.Errorf("%s must be sent empty to clear a previous value", key)
+			continue
+		}
+		if got != "" {
+			t.Errorf("%s = %q, want empty", key, got)
+		}
+	}
+	if _, present := put["integrationids"]; present {
+		t.Error("integrationids was never set and must stay omitted")
+	}
+}
+
+// TestDataSourcePingdomCheck exercises the check data source, whose purpose is
+// to show what the API reports -- in particular whether `teams` comes back
+// populated, which distinguishes a read problem from a write problem.
+func TestDataSourcePingdomCheck(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	cfg["teamids"] = []any{324111}
+	cfg["userids"] = []any{111}
+	cfg["custom_message"] = "paged by oncall"
+	cfg["probefilters"] = "region:NA"
+	cfg["tags"] = "private,chi"
+	applyCheck(t, meta, nil, cfg)
+
+	ds := dataSourcePingdomCheck()
+	d := ds.TestResourceData()
+	if err := d.Set("check_id", fakeCheckID); err != nil {
+		t.Fatal(err)
+	}
+	if diags := dataSourcePingdomCheckRead(context.Background(), d, meta); diags.HasError() {
+		t.Fatalf("read: %v", diags)
+	}
+
+	if got := d.Get("name").(string); got != "prod-api" {
+		t.Errorf("name = %q", got)
+	}
+	if got := d.Get("type").(string); got != checkTypeHTTP {
+		t.Errorf("type = %q, want http", got)
+	}
+	if got := d.Get("custom_message").(string); got != "paged by oncall" {
+		t.Errorf("custom_message = %q", got)
+	}
+	teams := d.Get("teams").([]any)
+	if len(teams) != 1 {
+		t.Fatalf("teams = %v, want one entry", teams)
+	}
+	if id := teams[0].(map[string]any)["id"].(int); id != 324111 {
+		t.Errorf("teams[0].id = %d, want 324111", id)
+	}
+	teamids := d.Get("teamids").([]any)
+	if len(teamids) != 1 || teamids[0].(int) != 324111 {
+		t.Errorf("teamids = %v, want [324111]", teamids)
+	}
+	if got := d.Get("userids").([]any); len(got) != 1 || got[0].(int) != 111 {
+		t.Errorf("userids = %v, want [111]", got)
+	}
+	if got := d.Get("probefilters").([]any); len(got) != 1 {
+		t.Errorf("probefilters = %v", got)
+	}
+}
+
+// A missing check must report which check it could not read.
+func TestDataSourcePingdomCheckMissing(t *testing.T) {
+	fake := &fakeCheckAPI{gone: true}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	d := dataSourcePingdomCheck().TestResourceData()
+	if err := d.Set("check_id", fakeCheckID); err != nil {
+		t.Fatal(err)
+	}
+	diags := dataSourcePingdomCheckRead(context.Background(), d, meta)
+	if !diags.HasError() {
+		t.Fatal("expected an error for a missing check")
+	}
+	if !strings.Contains(diags[0].Summary, strconv.Itoa(fakeCheckID)) {
+		t.Errorf("error should name the check id: %s", diags[0].Summary)
+	}
+}
+
+// TestDataSourcePingdomChecks covers the list data source. Its purpose is to let
+// an account be scanned read-only for any check that has a team attached.
+func TestDataSourcePingdomChecks(t *testing.T) {
+	fake := &fakeCheckAPI{}
+	meta, stop := fake.start(t)
+	defer stop()
+
+	cfg := baseHTTPConfig()
+	cfg["teamids"] = []any{324111}
+	cfg["tags"] = "private,chi"
+	applyCheck(t, meta, nil, cfg)
+
+	d := dataSourcePingdomChecks().TestResourceData()
+	if diags := dataSourcePingdomChecksRead(context.Background(), d, meta); diags.HasError() {
+		t.Fatalf("read: %v", diags)
+	}
+
+	checks := d.Get("checks").([]any)
+	if len(checks) != 1 {
+		t.Fatalf("checks = %d entries, want 1", len(checks))
+	}
+	entry := checks[0].(map[string]any)
+	if got := entry["check_id"].(int); got != fakeCheckID {
+		t.Errorf("check_id = %d, want %d", got, fakeCheckID)
+	}
+	if got := entry["name"].(string); got != "prod-api" {
+		t.Errorf("name = %q", got)
+	}
+	// The list endpoint reports teams for this check, so teamids is derived.
+	if got := entry["teamids"].([]any); len(got) != 1 || got[0].(int) != 324111 {
+		t.Errorf("teamids = %v, want [324111]", got)
 	}
 }

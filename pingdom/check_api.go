@@ -38,10 +38,20 @@ func readCheck(client *pingdom.Client, id int) (*checkResponse, error) {
 		return nil, errors.New("empty check in API response")
 	}
 
-	// go-pingdom backfills this in Checks.Read; the API only reports `teams`.
-	body.Check.TeamIds = make([]int, len(body.Check.Teams))
-	for i := range body.Check.Teams {
-		body.Check.TeamIds[i] = body.Check.Teams[i].ID
+	// go-pingdom backfills TeamIds from `teams`, which is how the documented
+	// check response reports assigned teams.
+	//
+	// Only overwrite when `teams` is actually populated. CheckResponse.TeamIds
+	// carries no json tag, so encoding/json already matches a `teamids` key in
+	// the response onto it; unconditionally replacing it with a slice derived
+	// from an empty `teams` would discard that and make the attribute
+	// impossible to read back -- which shows up as `teamids` reappearing in
+	// every plan. go-pingdom's own Checks.Read has this flaw.
+	if len(body.Check.Teams) > 0 {
+		body.Check.TeamIds = make([]int, len(body.Check.Teams))
+		for i := range body.Check.Teams {
+			body.Check.TeamIds[i] = body.Check.Teams[i].ID
+		}
 	}
 
 	return body.Check, nil
@@ -97,7 +107,7 @@ func (ck httpCheck) PutParams() map[string]string {
 		m["shouldnotcontain"] = ck.ShouldNotContain
 	}
 
-	applyClearParams(m, ck.clear)
+	finalizePutParams(m, ck.clear)
 	return m
 }
 
@@ -109,16 +119,59 @@ type tcpCheck struct {
 
 func (ck tcpCheck) PutParams() map[string]string {
 	m := ck.TCPCheck.PutParams()
-	applyClearParams(m, ck.clear)
+	finalizePutParams(m, ck.clear)
 	return m
 }
 
-// applyClearParams adds each named parameter as empty, unless a value is
-// already being sent for it.
-func applyClearParams(m map[string]string, clear []string) {
+// pingCheck and dnsCheck carry no type-specific corrections; they exist so every
+// check type gets the shared parameter handling in finalizePutParams.
+type pingCheck struct {
+	*pingdom.PingCheck
+	clear []string
+}
+
+func (ck pingCheck) PutParams() map[string]string {
+	m := ck.PingCheck.PutParams()
+	finalizePutParams(m, ck.clear)
+	return m
+}
+
+type dnsCheck struct {
+	*pingdom.DNSCheck
+	clear []string
+}
+
+func (ck dnsCheck) PutParams() map[string]string {
+	m := ck.DNSCheck.PutParams()
+	finalizePutParams(m, ck.clear)
+	return m
+}
+
+// alwaysRenderedListParams are comma-separated list parameters that go-pingdom
+// emits on every request, empty or not.
+//
+// Sending one empty asks Pingdom to remove the corresponding assignment. That is
+// wanted when the configuration has genuinely dropped a value, but harmful
+// otherwise: this API mishandles empty parameters it did not expect -- an empty
+// `shouldnotcontain` is rejected outright with 400 -- and an empty `userids`
+// appears to discard the `teamids` sent in the same request, so a team
+// assignment never takes effect.
+var alwaysRenderedListParams = []string{"userids", "teamids", "integrationids"}
+
+// finalizePutParams applies the two shared rules: send an empty parameter only
+// when deliberately clearing a value, and never send one that was never set.
+func finalizePutParams(m map[string]string, clear []string) {
+	clearing := make(map[string]bool, len(clear))
 	for _, key := range clear {
+		clearing[key] = true
 		if _, ok := m[key]; !ok {
 			m[key] = ""
+		}
+	}
+
+	for _, key := range alwaysRenderedListParams {
+		if m[key] == "" && !clearing[key] {
+			delete(m, key)
 		}
 	}
 }
